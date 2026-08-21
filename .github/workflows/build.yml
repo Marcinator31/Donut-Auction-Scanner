@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -19,27 +18,99 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Prüft, dass gradle-wrapper.jar wirklich ein offizielles Gradle-Artefakt
-      # ist und niemand einen manipulierten Wrapper eingeschleust hat.
-      - name: Validate Gradle wrapper
+      # ------------------------------------------------------------------
+      # Preflight: prueft VOR dem Build, ob ueberhaupt alle Dateien da sind.
+      # Beim Hochladen ueber die GitHub-Weboberflaeche fehlen erfahrungsgemaess
+      # gerne die Binaerdatei des Wrappers oder versteckte Ordner. Dann bricht
+      # Gradle mit einer kryptischen Meldung ab - hier steht stattdessen sofort,
+      # welche Datei fehlt.
+      # ------------------------------------------------------------------
+      - name: Preflight - Dateien pruefen
+        run: |
+          echo "::group::Repo-Inhalt"
+          find . -path ./.git -prune -o -type f -print | sort
+          echo "::endgroup::"
+
+          missing=0
+          for f in \
+            settings.gradle \
+            build.gradle \
+            gradle.properties \
+            gradlew \
+            gradle/wrapper/gradle-wrapper.jar \
+            gradle/wrapper/gradle-wrapper.properties \
+            src/main/resources/fabric.mod.json
+          do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::FEHLT: $f"
+              missing=1
+            else
+              echo "ok  $f"
+            fi
+          done
+
+          javacount=$(find src -name '*.java' 2>/dev/null | wc -l)
+          echo "Java-Dateien gefunden: $javacount"
+          if [ "$javacount" -lt 1 ]; then
+            echo "::error::Keine .java-Dateien unter src/ gefunden."
+            missing=1
+          fi
+
+          size=$(stat -c%s gradle/wrapper/gradle-wrapper.jar 2>/dev/null || echo 0)
+          echo "gradle-wrapper.jar: $size Bytes"
+          if [ "$size" -lt 10000 ]; then
+            echo "::error::gradle-wrapper.jar fehlt oder ist beschaedigt (nur $size Bytes)."
+            echo "Beim Upload ueber die Weboberflaeche geht diese Binaerdatei oft verloren."
+            missing=1
+          fi
+
+          if [ "$missing" -ne 0 ]; then
+            echo "Preflight fehlgeschlagen - siehe Meldungen oben."
+            exit 1
+          fi
+          echo "Preflight ok."
+
+      - name: Gradle-Wrapper pruefen
         uses: gradle/actions/wrapper-validation@v4
 
-      - name: Set up JDK 25
+      - name: JDK 25 einrichten
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
 
-      - name: Set up Gradle
+      - name: Umgebung anzeigen
+        run: |
+          echo "::group::Versionen"
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "--- gradle.properties ---"
+          cat gradle.properties
+          echo "::endgroup::"
+
+      - name: Gradle einrichten
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Make gradlew executable
+      - name: gradlew ausfuehrbar machen
         run: chmod +x ./gradlew
 
-      - name: Build
-        run: ./gradlew build --stacktrace --no-daemon
+      # ------------------------------------------------------------------
+      # Ab hier drei getrennte Schritte statt einem grossen "build".
+      # Dadurch zeigt das rote Kreuz direkt, WORAN es liegt:
+      #   Schritt A rot -> Wrapper/Gradle-Download
+      #   Schritt B rot -> Loom-Plugin, Minecraft-Download, Abhaengigkeiten
+      #   Schritt C rot -> der eigentliche Java-Code
+      # ------------------------------------------------------------------
+      - name: A - Gradle startet
+        run: ./gradlew --version --no-daemon
 
-      - name: Upload mod jar
+      - name: B - Projekt laesst sich konfigurieren
+        run: ./gradlew tasks --no-daemon --stacktrace
+
+      - name: C - Kompilieren und bauen
+        run: ./gradlew build --no-daemon --stacktrace
+
+      - name: Mod-JAR hochladen
         uses: actions/upload-artifact@v4
         with:
           name: donutmarket-dev-build
@@ -49,10 +120,24 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload sources jar
+      # Bei Fehlschlag alles einsammeln, was beim Nachschauen hilft.
+      - name: Fehlerberichte einsammeln
+        if: failure()
+        run: |
+          echo "::group::Compiler- und Testberichte"
+          find build -name '*.txt' -o -name '*.html' -o -name '*.log' 2>/dev/null | head -50 || true
+          echo "::endgroup::"
+          echo "::group::Loom-Log"
+          tail -n 200 build/loom-cache/*.log 2>/dev/null || echo "kein Loom-Log"
+          echo "::endgroup::"
+
+      - name: Berichte hochladen
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: donutmarket-sources
-          path: build/libs/*-sources.jar
-          if-no-files-found: warn
-          retention-days: 14
+          name: build-reports
+          path: |
+            build/reports/
+            build/tmp/
+          if-no-files-found: ignore
+          retention-days: 7
