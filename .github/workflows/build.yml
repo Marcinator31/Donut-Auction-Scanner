@@ -2,7 +2,6 @@ name: Build
 
 on:
   push:
-    branches: [ main ]
   pull_request:
   workflow_dispatch:
 
@@ -11,133 +10,113 @@ permissions:
 
 jobs:
   build:
-    name: Build (Java 25)
+    name: JAR bauen
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ------------------------------------------------------------------
-      # Preflight: prueft VOR dem Build, ob ueberhaupt alle Dateien da sind.
-      # Beim Hochladen ueber die GitHub-Weboberflaeche fehlen erfahrungsgemaess
-      # gerne die Binaerdatei des Wrappers oder versteckte Ordner. Dann bricht
-      # Gradle mit einer kryptischen Meldung ab - hier steht stattdessen sofort,
-      # welche Datei fehlt.
-      # ------------------------------------------------------------------
-      - name: Preflight - Dateien pruefen
-        run: |
-          echo "::group::Repo-Inhalt"
-          find . -path ./.git -prune -o -type f -print | sort
-          echo "::endgroup::"
-
-          missing=0
-          for f in \
-            settings.gradle \
-            build.gradle \
-            gradle.properties \
-            gradlew \
-            gradle/wrapper/gradle-wrapper.jar \
-            gradle/wrapper/gradle-wrapper.properties \
-            src/main/resources/fabric.mod.json
-          do
-            if [ ! -f "$f" ]; then
-              echo "::error file=$f::FEHLT: $f"
-              missing=1
-            else
-              echo "ok  $f"
-            fi
-          done
-
-          javacount=$(find src -name '*.java' 2>/dev/null | wc -l)
-          echo "Java-Dateien gefunden: $javacount"
-          if [ "$javacount" -lt 1 ]; then
-            echo "::error::Keine .java-Dateien unter src/ gefunden."
-            missing=1
-          fi
-
-          size=$(stat -c%s gradle/wrapper/gradle-wrapper.jar 2>/dev/null || echo 0)
-          echo "gradle-wrapper.jar: $size Bytes"
-          if [ "$size" -lt 10000 ]; then
-            echo "::error::gradle-wrapper.jar fehlt oder ist beschaedigt (nur $size Bytes)."
-            echo "Beim Upload ueber die Weboberflaeche geht diese Binaerdatei oft verloren."
-            missing=1
-          fi
-
-          if [ "$missing" -ne 0 ]; then
-            echo "Preflight fehlgeschlagen - siehe Meldungen oben."
-            exit 1
-          fi
-          echo "Preflight ok."
-
-      - name: Gradle-Wrapper pruefen
-        uses: gradle/actions/wrapper-validation@v4
-
-      - name: JDK 25 einrichten
+      - name: JDK 25
+        id: java
+        continue-on-error: true
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
 
-      - name: Umgebung anzeigen
-        run: |
-          echo "::group::Versionen"
-          java -version
-          echo "JAVA_HOME=$JAVA_HOME"
-          echo "--- gradle.properties ---"
-          cat gradle.properties
-          echo "::endgroup::"
-
-      - name: Gradle einrichten
+      - name: Gradle
+        id: gradlesetup
+        continue-on-error: true
         uses: gradle/actions/setup-gradle@v4
 
       - name: gradlew ausfuehrbar machen
+        continue-on-error: true
         run: chmod +x ./gradlew
 
+      # Der eigentliche Build. continue-on-error, damit der Lauf nicht hier
+      # abbricht - erst wird die Meldung eingesammelt und angezeigt, dann
+      # faellt der Job ganz am Ende durch.
+      - name: Bauen
+        id: build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew build --no-daemon --stacktrace 2>&1 | tee gradle-output.txt
+
       # ------------------------------------------------------------------
-      # Ab hier drei getrennte Schritte statt einem grossen "build".
-      # Dadurch zeigt das rote Kreuz direkt, WORAN es liegt:
-      #   Schritt A rot -> Wrapper/Gradle-Download
-      #   Schritt B rot -> Loom-Plugin, Minecraft-Download, Abhaengigkeiten
-      #   Schritt C rot -> der eigentliche Java-Code
+      # Schreibt das Ergebnis auf die STARTSEITE des Laufs.
+      # Kein Durchklicken durch Schritte noetig - beim Oeffnen des Laufs
+      # steht die Fehlermeldung direkt da.
       # ------------------------------------------------------------------
-      - name: A - Gradle startet
-        run: ./gradlew --version --no-daemon
+      - name: Ergebnis anzeigen
+        if: always()
+        run: |
+          S="$GITHUB_STEP_SUMMARY"
 
-      - name: B - Projekt laesst sich konfigurieren
-        run: ./gradlew tasks --no-daemon --stacktrace
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            echo "# JAR fertig gebaut" >> "$S"
+            echo "" >> "$S"
+            echo "Herunterladen: auf dieser Seite ganz nach unten scrollen, Abschnitt **Artifacts**." >> "$S"
+            echo "" >> "$S"
+            echo "| Datei | Groesse |" >> "$S"
+            echo "|---|---|" >> "$S"
+            for f in build/libs/*.jar; do
+              [ -f "$f" ] || continue
+              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |" >> "$S"
+            done
+            exit 0
+          fi
 
-      - name: C - Kompilieren und bauen
-        run: ./gradlew build --no-daemon --stacktrace
+          echo "# Build fehlgeschlagen" >> "$S"
+          echo "" >> "$S"
 
-      - name: Mod-JAR hochladen
+          if [ "${{ steps.java.outcome }}" != "success" ]; then
+            echo "**Java 25 liess sich nicht einrichten.**" >> "$S"
+          fi
+          if [ "${{ steps.gradlesetup.outcome }}" != "success" ]; then
+            echo "**Gradle liess sich nicht einrichten.**" >> "$S"
+          fi
+
+          if [ ! -f gradle-output.txt ]; then
+            echo "Gradle wurde gar nicht erst gestartet - siehe die Schritte oben." >> "$S"
+            exit 1
+          fi
+
+          echo "## Das ist schiefgelaufen" >> "$S"
+          echo "" >> "$S"
+          echo '```' >> "$S"
+          # Gradles eigener Fehlerblock: alles ab "What went wrong"
+          if grep -q "What went wrong" gradle-output.txt; then
+            sed -n '/What went wrong/,/Try:/p' gradle-output.txt | head -40 >> "$S"
+          fi
+          # Compilerfehler mit Datei und Zeile
+          grep -E "^(e: |.*\.java:[0-9]+: error:)" gradle-output.txt | head -25 >> "$S"
+          echo '```' >> "$S"
+
+          echo "" >> "$S"
+          echo "## Letzte 40 Zeilen" >> "$S"
+          echo '```' >> "$S"
+          tail -n 40 gradle-output.txt >> "$S"
+          echo '```' >> "$S"
+
+          echo "" >> "$S"
+          echo "Das komplette Log liegt unten unter **Artifacts** als \`build-log\`." >> "$S"
+          exit 1
+
+      - name: JAR hochladen
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: donutmarket-dev-build
+          name: DonutMarket-JAR
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar
           if-no-files-found: error
-          retention-days: 30
 
-      # Bei Fehlschlag alles einsammeln, was beim Nachschauen hilft.
-      - name: Fehlerberichte einsammeln
-        if: failure()
-        run: |
-          echo "::group::Compiler- und Testberichte"
-          find build -name '*.txt' -o -name '*.html' -o -name '*.log' 2>/dev/null | head -50 || true
-          echo "::endgroup::"
-          echo "::group::Loom-Log"
-          tail -n 200 build/loom-cache/*.log 2>/dev/null || echo "kein Loom-Log"
-          echo "::endgroup::"
-
-      - name: Berichte hochladen
-        if: failure()
+      - name: Log hochladen
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-reports
-          path: |
-            build/reports/
-            build/tmp/
+          name: build-log
+          path: gradle-output.txt
           if-no-files-found: ignore
-          retention-days: 7
